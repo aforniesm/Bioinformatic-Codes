@@ -1,0 +1,744 @@
+---
+title: "Exercise scRNA-Seq"
+author: "Anton Fornies"
+date: "2025-06-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Matrix)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(openxlsx)
+library(tidyverse)
+```
+
+LOADING THE DATA
+
+```{r}
+matrix <- readMM("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Exp_data_UMIcounts.mtx")
+dim(matrix)
+
+barcodes <- read.csv("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Cells.csv")
+
+features <- read.delim("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Genes.txt", header = F)
+
+metadata <- read.csv("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Samples.csv")
+
+```
+
+MATRIX COUNTS
+
+```{r}
+
+rownames(matrix) <- features$V1
+colnames(matrix) <- barcodes$cell_name
+
+```
+
+SEURAT OBJECT + METADATA
+
+```{r}
+
+seurat <- CreateSeuratObject(counts = matrix,
+                             assay = "RNA",
+                             names.delim = "_", 
+                             names.field = 1:3)
+
+seurat@meta.data$cell_name <- rownames(seurat@meta.data)
+
+barcodes$nCount_RNA <- NULL
+barcodes$nFeature_RNA <- NULL
+
+seurat@meta.data <- seurat@meta.data %>%
+  left_join(barcodes, by = "cell_name")
+
+rownames(seurat@meta.data) <- seurat@meta.data$cell_name
+
+```
+
+QUALITY CONTROL
+
+```{r}
+# % mito genes
+seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+
+# QC Graphs 
+Idents(seurat) <- "orig.ident"
+vln <- VlnPlot(seurat, features = "percent.mt") + theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 8))
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\QC2.png", res = 550, width = 5500, height = 3000)
+print(vln)
+dev.off
+
+scat <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + ggtitle("nCount_RNA vs nFeature_RNA")
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\QC1.png", res = 550, width = 5500, height = 3000)
+print(scat)
+dev.off
+
+mean(seurat@meta.data$nCount_RNA)
+mean(seurat@meta.data$nFeature_RNA)
+
+# QC is already done but just to be sure
+seurat <- subset(seurat,
+                 subset = nFeature_RNA > 200 &
+                          nFeature_RNA < 6000 &
+                          nCount_RNA > 400 &
+                          percent.mt < 15)
+```
+
+CELL CYCLE SCORE
+
+```{r}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+```
+
+DATA PRE-PROCESSING
+
+```{r}
+seurat <- NormalizeData(seurat)
+seurat <- FindVariableFeatures(seurat)
+seurat <- CellCycleScoring(seurat, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+seurat <- ScaleData(seurat, vars.to.regress = c("nCount_RNA","percent.mt","S.Score","G2M.Score"))
+seurat <- RunPCA(seurat)
+
+ElbowPlot(seurat, reduction = "pca")
+
+seurat <- FindNeighbors(seurat, dims = 1:20, k.param = 20, compute.SNN = T, n.trees = 100)
+seurat <- FindClusters(seurat, resolution = 0.8)
+
+seurat <- RunUMAP(seurat, dims = 1:20)
+```
+
+Visualizations
+
+```{r}
+Idents(seurat) <- "seurat_clusters"
+
+clusters <- DimPlot(seurat, reduction = "umap", label = TRUE)
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\clusters.png", res = 550, width = 5500, height = 3000)
+print(clusters)
+dev.off
+
+orig_cell <- DimPlot(seurat, reduction = "umap", group.by = "cell_type")
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\orig_celltype.png", res = 550, width = 5500, height = 3000)
+print(orig_cell)
+dev.off
+
+cc <- DimPlot(seurat, reduction = "umap", group.by = "Phase")
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\CC.png", res = 550, width = 5500, height = 3000)
+print(cc)
+dev.off
+
+pat <- DimPlot(seurat, reduction = "umap", group.by = "sample")
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Patients.png", res = 550, width = 5500, height = 3000)
+print(pat)
+dev.off
+```
+
+Markers
+
+```{r}
+markers <- FindAllMarkers(seurat, test.use = "MAST", only.pos = T, latent.vars = c("nCount_RNA","percent.mt","S.Score","G2M.Score"))
+
+markers <- markers %>%
+  filter(p_val_adj < 0.05)
+top_markers <- markers%>% group_by(cluster) %>% top_n(n = 400, wt = avg_log2FC)
+```
+
+Cell type annotation using scCATCH
+
+```{r}
+library(scCATCH)
+
+data <- GetAssayData(seurat, layer = "data")
+
+clusters <- seurat$seurat_clusters
+
+sc <- createscCATCH(data = data, cluster = as.character(clusters))
+sc <- findmarkergene(object = sc, species = "Human", marker = cellmatch, tissue = "Breast", cancer = "Breast Cancer")
+result <- findcelltype(object = sc) # Clusters missing
+
+```
+
+scCATCH but markers found by MAST
+
+```{r}
+# With Markers reveal by FindAllMarkers
+top_markers <- top_markers %>% ungroup()
+
+sc@markergene <- top_markers
+
+result <- findcelltype(object = sc)
+```
+
+With the predictions from both scCATCH and PanglaoDB
+
+```{r}
+pred_df <- data.frame(
+  seurat_clusters = as.character(0:21),
+  pred_celltype = c(
+    "T Helper CD4+", "Malignant cancer cell", "T Cytotoxic CD8+ ", "Malignant cancer cell", "Macrophage", "Endothelial cell", "T Helper CD4+", "Malignant cancer cell", "Malignant cancer cell", "Malignant cancer cell", "Dendritic cell", "B cell", "Natural Killers", "Fibroblast", "Malignant cancer cell", "Malignant cancer cell", "Malignant cancer cell", "Malignant cancer cell", "Malignant cancer cell", "T Helper CD4+", "Malignant cancer cell", "T Helper CD4+"),
+  stringsAsFactors = FALSE
+)
+
+# Convertir seurat_clusters en character si aún no lo es
+seurat@meta.data$seurat_clusters <- as.character(seurat@meta.data$seurat_clusters)
+
+# Merge con metadata
+seurat@meta.data <- left_join(
+  seurat@meta.data,
+  pred_df,
+  by = "seurat_clusters"
+)
+rownames(seurat@meta.data) <- seurat@meta.data$cell_name
+
+celltypes <- DimPlot(
+  seurat,
+  group.by = "pred_celltype"
+) +
+  ggtitle("UMAP of Predicted Cell Types") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2") +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10), 
+    legend.position = "bottom"
+  )
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Celltypes.png", res = 550, width = 5000, height = 3800)
+print(celltypes)
+dev.off
+
+table(seurat@meta.data$pred_celltype)
+table(barcodes$cell_type)
+
+```
+
+Cell type annotation using SingleR
+
+```{r}
+
+library(SingleR)
+library(celldex)  
+expr <- GetAssayData(seurat, slot = "data")
+meta <- seurat@meta.data
+
+ref <- celldex::DatabaseImmuneCellExpressionData()
+
+pred <- SingleR(test = expr, ref = ref, labels = ref$label.main)
+
+seurat$SingleR_label <- pred$labels[match(rownames(seurat@meta.data), rownames(pred))]
+
+# Monocytes confounded with cancer cells
+seurat@meta.data$SingleR_label[seurat@meta.data$SingleR_label == "Malignant cells"] <- "Monocytes"
+
+DimPlot(seurat, group.by = "SingleR_label",split.by = "SingleR_label")
+
+# Evaluate perform of singleR
+p <- plotScoreHeatmap(pred)
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\heat_singleR.png", res = 550, width = 4500, height = 3500)
+print(p)
+dev.off
+
+plotDeltaDistribution(pred)
+
+# Cluster correspondence
+tab <- table(Assigned=pred$labels, Cluster=seurat$seurat_clusters)
+tab
+
+library(pheatmap)
+pheatmap(log(tab+10))
+
+singleR <- DimPlot(seurat, group.by = "SingleR_label")
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\singleR2.png", res = 550, width = 5500, height = 3000)
+print(singleR)
+dev.off
+
+table(seurat@meta.data$pred_celltype)
+table(barcodes$cell_type)
+table(seurat@meta.data$SingleR_label)
+
+```
+
+Comparing cancer subtypes: "TNBC" vs "ER+/PR+/HER2-"
+Pre and On samples: 2 time points
+
+```{r}
+# Metadata Cancer Subtype
+metadata$sample <- as.character(metadata$sample)
+seurat@meta.data$sample <- as.character(seurat@meta.data$sample)
+
+bc_map <- setNames(metadata$mutation_hormonal_subtype, metadata$sample)
+
+seurat@meta.data$Cancer_Subtype <- bc_map[seurat@meta.data$sample]
+table(seurat@meta.data$Cancer_Subtype)
+
+Idents(seurat) <- "Cancer_Subtype"
+
+rownames(seurat@assays[["RNA"]]@layers[["counts"]]) <- rownames(seurat)
+counts_matrix <- seurat@assays[["RNA"]]@layers[["counts"]]
+gene_counts <- Matrix::rowSums(counts_matrix > 0)
+genes_to_keep <- names(gene_counts[gene_counts >= 400])
+seurat <- subset(seurat, features = genes_to_keep)
+
+seurat_On <- subset(seurat, subset = grepl("On$", orig.ident))
+seurat_Pre <- subset(seurat, subset = grepl("Pre$", orig.ident))
+
+DEGs_Pre <- FindMarkers(seurat_Pre, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-", test.use = "MAST", latent.vars = c("nCount_RNA","percent.mt","S.Score","G2M.Score"))
+DEGs_Pre$Gene <- rownames(DEGs_Pre)
+write.xlsx(DEGs_Pre, "C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\DEGs_pre.xlsx")
+
+library(EnhancedVolcano)
+library(ggrepel)
+vl1 <- EnhancedVolcano(DEGs_Pre,
+  lab = DEGs_Pre$Gene,
+  x = 'avg_log2FC',
+  y = 'p_val',
+  pCutoff = 0.05,
+  FCcutoff = 0.5,
+  xlim = c(-3, 3),
+  pointSize = 2.5,
+  labSize = 3,  
+  colAlpha = 0.75,
+  legendPosition = 'right',
+  title = 'Comparing Breast cancer subtypes',
+  subtitle = 'TNBC vs ER+/PR+/HER2-',
+  boxedLabels = TRUE,  
+  drawConnectors = TRUE,
+  widthConnectors = 0.3
+) +
+  theme(legend.position = "bottom", 
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5)
+  )
+
+
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Volcano_PRE.png", res = 550, width = 5500, height = 4200)
+print(vl1)
+dev.off
+
+###############################################################################
+
+DEGs_On <- FindMarkers(seurat_On, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-", test.use = "MAST", latent.vars = c("nCount_RNA","percent.mt","S.Score","G2M.Score"))
+DEGs_On$Gene <- rownames(DEGs_On)
+write.xlsx(DEGs_On, "C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\DEGs_on.xlsx")
+
+vl2 <- EnhancedVolcano(DEGs_On,
+                lab = DEGs_On$Gene,
+               x = 'avg_log2FC',
+  y = 'p_val',
+  pCutoff = 0.05,
+  FCcutoff = 0.5,
+  xlim = c(-3, 3),
+  pointSize = 2.5,
+  labSize = 3,  
+  colAlpha = 0.75,
+  legendPosition = 'right',
+  title = 'Comparing Breast cancer subtypes',
+  subtitle = 'TNBC vs ER+/PR+/HER2-',
+  boxedLabels = TRUE,  
+  drawConnectors = TRUE,
+  widthConnectors = 0.3
+) +
+  theme(legend.position = "bottom", 
+        plot.title.position = "plot",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5)
+  )
+
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\Volcano_ON.png", res = 550, width = 5500, height = 4200)
+print(vl2)
+dev.off
+
+#####################################################################3
+
+top_pre <- DEGs_Pre %>%
+  filter(p_val < 0.05 & abs(avg_log2FC) > 0.5) %>%
+  mutate(abs_log2FC = abs(avg_log2FC)) %>%
+  arrange(desc(abs_log2FC))
+
+top_on <- DEGs_On %>%
+  filter(p_val < 0.05 & abs(avg_log2FC) > 0.5) %>%
+  mutate(abs_log2FC = abs(avg_log2FC)) %>%
+  arrange(desc(abs_log2FC))
+
+both <- intersect(top_pre, top_on)
+
+```
+
+
+For each cell type
+
+Pre-treatment
+
+```{r}
+Idents(seurat_Pre) <- "Cancer_Subtype"
+
+# B cell
+subset_bcell <- subset(seurat_Pre, subset = pred_celltype == "B cell")
+Idents(subset_bcell) <- "Cancer_Subtype"
+degs_bcell <- FindMarkers(subset_bcell,
+                          ident.1 = "TNBC",
+                          ident.2 = "ER+/PR+/HER2-",
+                          test.use = "MAST",
+                          latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_bcell$gene <- rownames(degs_bcell)
+degs_bcell$celltype <- "B cell"
+
+# Dendritic cell
+subset_dendritic <- subset(seurat_Pre, subset = pred_celltype == "Dendritic cell")
+Idents(subset_dendritic) <- "Cancer_Subtype"
+degs_dendritic <- FindMarkers(subset_dendritic,
+                              ident.1 = "TNBC",
+                              ident.2 = "ER+/PR+/HER2-",
+                              test.use = "MAST",
+                              latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_dendritic$gene <- rownames(degs_dendritic)
+degs_dendritic$celltype <- "Dendritic cell"
+
+# Endothelial cell
+subset_endothelial <- subset(seurat_Pre, subset = pred_celltype == "Endothelial cell")
+Idents(subset_endothelial) <- "Cancer_Subtype"
+degs_endothelial <- FindMarkers(subset_endothelial,
+                                ident.1 = "TNBC",
+                                ident.2 = "ER+/PR+/HER2-",
+                                test.use = "MAST",
+                                latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_endothelial$gene <- rownames(degs_endothelial)
+degs_endothelial$celltype <- "Endothelial cell"
+
+# Fibroblast
+subset_fibroblast <- subset(seurat_Pre, subset = pred_celltype == "Fibroblast")
+Idents(subset_fibroblast) <- "Cancer_Subtype"
+degs_fibroblast <- FindMarkers(subset_fibroblast,
+                               ident.1 = "TNBC",
+                               ident.2 = "ER+/PR+/HER2-",
+                               test.use = "MAST",
+                               latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_fibroblast$gene <- rownames(degs_fibroblast)
+degs_fibroblast$celltype <- "Fibroblast"
+
+# Macrophage
+subset_macrophage <- subset(seurat_Pre, subset = pred_celltype == "Macrophage")
+Idents(subset_macrophage) <- "Cancer_Subtype"
+degs_macrophage <- FindMarkers(subset_macrophage,
+                               ident.1 = "TNBC",
+                               ident.2 = "ER+/PR+/HER2-",
+                               test.use = "MAST",
+                               latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_macrophage$gene <- rownames(degs_macrophage)
+degs_macrophage$celltype <- "Macrophage"
+
+# Malignant cancer cell
+subset_malignant <- subset(seurat_Pre, subset = pred_celltype == "Malignant cancer cell")
+Idents(subset_malignant) <- "Cancer_Subtype"
+degs_malignant <- FindMarkers(subset_malignant,
+                               ident.1 = "TNBC",
+                               ident.2 = "ER+/PR+/HER2-",
+                               test.use = "MAST",
+                               latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_malignant$gene <- rownames(degs_malignant)
+degs_malignant$celltype <- "Malignant cancer cell"
+
+# Natural Killers
+subset_nk <- subset(seurat_Pre, subset = pred_celltype == "Natural Killers")
+Idents(subset_nk) <- "Cancer_Subtype"
+degs_nk <- FindMarkers(subset_nk,
+                       ident.1 = "TNBC",
+                       ident.2 = "ER+/PR+/HER2-",
+                       test.use = "MAST",
+                       latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_nk$gene <- rownames(degs_nk)
+degs_nk$celltype <- "Natural Killers"
+
+# T Cytotoxic CD8+
+subset_cd8 <- subset(seurat_Pre, subset = pred_celltype == "T Cytotoxic CD8+ ")
+Idents(subset_cd8) <- "Cancer_Subtype"
+degs_cd8 <- FindMarkers(subset_cd8,
+                        ident.1 = "TNBC",
+                        ident.2 = "ER+/PR+/HER2-",
+                        test.use = "MAST",
+                        latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_cd8$gene <- rownames(degs_cd8)
+degs_cd8$celltype <- "T Cytotoxic CD8+"
+
+# T Helper CD4+
+subset_cd4 <- subset(seurat_Pre, subset = pred_celltype == "T Helper CD4+")
+Idents(subset_cd4) <- "Cancer_Subtype"
+degs_cd4 <- FindMarkers(subset_cd4,
+                        ident.1 = "TNBC",
+                        ident.2 = "ER+/PR+/HER2-",
+                        test.use = "MAST",
+                        latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_cd4$gene <- rownames(degs_cd4)
+degs_cd4$celltype <- "T Helper CD4+"
+
+# Bind all
+DEGs_celltype_Pre <- bind_rows(
+  degs_bcell,
+  degs_dendritic,
+  degs_endothelial,
+  degs_fibroblast,
+  degs_macrophage,
+  degs_malignant,
+  degs_nk,
+  degs_cd8,
+  degs_cd4
+)
+
+write.xlsx(DEGs_celltype_Pre, "C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\DEGs_celltype_pre.xlsx")
+
+```
+
+On-treatment
+
+```{r}
+Idents(seurat_On) <- "Cancer_Subtype"
+
+# B cell
+subset_b <- subset(seurat_On, subset = pred_celltype == "B cell")
+Idents(subset_b) <- "Cancer_Subtype"
+degs_b <- FindMarkers(subset_b, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                      test.use = "MAST",
+                      latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_b$gene <- rownames(degs_b)
+degs_b$celltype <- "B cell"
+
+# Dendritic cell
+subset_dc <- subset(seurat_On, subset = pred_celltype == "Dendritic cell")
+Idents(subset_dc) <- "Cancer_Subtype"
+degs_dc <- FindMarkers(subset_dc, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                       test.use = "MAST",
+                       latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_dc$gene <- rownames(degs_dc)
+degs_dc$celltype <- "Dendritic cell"
+
+# Endothelial cell
+subset_endo <- subset(seurat_On, subset = pred_celltype == "Endothelial cell")
+Idents(subset_endo) <- "Cancer_Subtype"
+degs_endo <- FindMarkers(subset_endo, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                         test.use = "MAST",
+                         latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_endo$gene <- rownames(degs_endo)
+degs_endo$celltype <- "Endothelial cell"
+
+# Fibroblast
+subset_fib <- subset(seurat_On, subset = pred_celltype == "Fibroblast")
+Idents(subset_fib) <- "Cancer_Subtype"
+degs_fib <- FindMarkers(subset_fib, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                        test.use = "MAST",
+                        latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_fib$gene <- rownames(degs_fib)
+degs_fib$celltype <- "Fibroblast"
+
+# Macrophage
+subset_mac <- subset(seurat_On, subset = pred_celltype == "Macrophage")
+Idents(subset_mac) <- "Cancer_Subtype"
+degs_mac <- FindMarkers(subset_mac, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                        test.use = "MAST",
+                        latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_mac$gene <- rownames(degs_mac)
+degs_mac$celltype <- "Macrophage"
+
+# Malignant cancer cell
+subset_mal <- subset(seurat_On, subset = pred_celltype == "Malignant cancer cell")
+Idents(subset_mal) <- "Cancer_Subtype"
+degs_mal <- FindMarkers(subset_mal, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                        test.use = "MAST",
+                        latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_mal$gene <- rownames(degs_mal)
+degs_mal$celltype <- "Malignant cancer cell"
+
+# Natural Killers
+subset_nk <- subset(seurat_On, subset = pred_celltype == "Natural Killers")
+Idents(subset_nk) <- "Cancer_Subtype"
+degs_nk <- FindMarkers(subset_nk, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                       test.use = "MAST",
+                       latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_nk$gene <- rownames(degs_nk)
+degs_nk$celltype <- "Natural Killers"
+
+# T Cytotoxic CD8+
+subset_cd8 <- subset(seurat_On, subset = pred_celltype == "T Cytotoxic CD8+ ")
+Idents(subset_cd8) <- "Cancer_Subtype"
+degs_cd8 <- FindMarkers(subset_cd8, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                        test.use = "MAST",
+                        latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_cd8$gene <- rownames(degs_cd8)
+degs_cd8$celltype <- "T Cytotoxic CD8+"
+
+# T Helper CD4+
+subset_cd4 <- subset(seurat_On, subset = pred_celltype == "T Helper CD4+")
+Idents(subset_cd4) <- "Cancer_Subtype"
+degs_cd4 <- FindMarkers(subset_cd4, ident.1 = "TNBC", ident.2 = "ER+/PR+/HER2-",
+                        test.use = "MAST",
+                        latent.vars = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+degs_cd4$gene <- rownames(degs_cd4)
+degs_cd4$celltype <- "T helper CD4+"
+
+DEGs_celltype_On <- bind_rows(
+  degs_b,
+  degs_dc,
+  degs_endo,
+  degs_fib,
+  degs_mac,
+  degs_mal,
+  degs_nk,
+  degs_cd8,
+  degs_cd4
+)
+
+write.xlsx(DEGs_celltype_On, "C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\DEGs_celltype_On.xlsx")
+
+
+```
+
+HeatMaps per cell type
+
+```{r}
+library(ComplexHeatmap)
+
+top_pre_10 <- top_pre %>% slice_head(n = 10)
+
+DEGs_celltype_Pre_TOP <- DEGs_celltype_Pre %>%
+  filter(gene %in% top_pre_10$Gene)
+
+heatmap_data_pre <- DEGs_celltype_Pre_TOP %>%
+  dplyr::select(gene, celltype, avg_log2FC) %>%
+  pivot_wider(names_from = celltype, values_from = avg_log2FC) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+heatmap_data_pre[is.na(heatmap_data_pre)] <- 0
+
+heatmap_pre <- Heatmap(
+  heatmap_data_pre,
+  col = colorRamp2(c(-3.5, 0, 3.5), c("steelblue", "white", "tomato")),
+  name = "log2FC",
+  rect_gp = gpar(col = "grey", lwd = 2),
+  row_names_gp = gpar(fontsize = 11),
+  row_names_side = "left",
+  column_names_gp = gpar(fontsize = 12),
+  column_names_rot = 90,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  clustering_method_columns = "ward.D2",
+  clustering_distance_columns = "euclidean",
+  column_title = "Specific cell types",
+  column_title_gp = gpar(fontsize = 10)
+)
+
+order <- rownames(heatmap_data_pre)
+
+# Bulk regulation
+bulk_sign <- top_pre_10 %>%
+  mutate(`Bulk dysregulation` = ifelse(avg_log2FC > 0, "Upregulation", "Downregulation")) %>%
+  dplyr::select(`Bulk dysregulation`) %>%
+  mutate(`Bulk dysregulation` = factor(`Bulk dysregulation`, levels = c("Downregulation", "Upregulation"))) %>%
+  as.matrix()
+
+bulk_sign <- bulk_sign[order, , drop = FALSE]
+
+regulation_colors <- c("Downregulation" = "steelblue", "Upregulation" = "tomato")
+
+heatmap_pre_bin <- Heatmap(
+  bulk_sign,
+  width = unit(0.8, "cm"),
+  col = regulation_colors,
+  name = "Regulation",
+  rect_gp = gpar(col = "grey", lwd = 2),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_names_gp = gpar(fontsize = 11),
+  column_names_gp = gpar(fontsize = 12),
+  column_title = "Bulk regulation",
+  column_title_gp = gpar(fontsize = 10)
+)
+draw(heatmap_pre + heatmap_pre_bin, heatmap_legend_side = "right")
+
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\heatmap_pre.png", res = 550, width = 6000, height = 4000)
+draw(heatmap_pre + heatmap_pre_bin, heatmap_legend_side = "right")
+dev.off
+```
+
+
+```{r}
+######################################################################33
+
+top_on_10 <- top_on %>% slice_head(n = 10)
+
+DEGs_celltype_On_TOP <- DEGs_celltype_On %>%
+  filter(gene %in% top_on_10$Gene)
+
+heatmap_data_on <- DEGs_celltype_On_TOP %>%
+  dplyr::select(gene, celltype, avg_log2FC) %>%
+  pivot_wider(names_from = celltype, values_from = avg_log2FC) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+heatmap_data_on[is.na(heatmap_data_on)] <- 0
+
+heatmap_on <- Heatmap(
+  heatmap_data_on,
+  col = colorRamp2(c(-3.5, 0, 3.5), c("steelblue", "white", "tomato")),
+  name = "log2FC",
+  rect_gp = gpar(col = "grey", lwd = 2),
+  row_names_gp = gpar(fontsize = 11),
+  row_names_side = "left",
+  column_names_gp = gpar(fontsize = 12),
+  column_names_rot = 90,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  clustering_method_columns = "ward.D2",
+  clustering_distance_columns = "euclidean",
+  column_title = "Specific cell types",
+  column_title_gp = gpar(fontsize = 10)
+)
+
+order <- rownames(heatmap_data_on)
+
+# Bulk regulation
+bulk_sign <- top_on_10 %>%
+  mutate(`Bulk dysregulation` = ifelse(avg_log2FC > 0, "Upregulation", "Downregulation")) %>%
+  dplyr::select(`Bulk dysregulation`) %>%
+  mutate(`Bulk dysregulation` = factor(`Bulk dysregulation`, levels = c("Downregulation", "Upregulation"))) %>%
+  as.matrix()
+
+bulk_sign <- bulk_sign[order, , drop = FALSE]
+
+regulation_colors <- c("Downregulation" = "steelblue", "Upregulation" = "tomato")
+
+heatmap_on_bin <- Heatmap(
+  bulk_sign,
+  width = unit(0.8, "cm"),
+  col = regulation_colors,
+  name = "Regulation",
+  rect_gp = gpar(col = "grey", lwd = 2),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_names_gp = gpar(fontsize = 11),
+  column_names_gp = gpar(fontsize = 12),
+  column_title = "Bulk regulation",
+  column_title_gp = gpar(fontsize = 10)
+)
+draw(heatmap_on + heatmap_on_bin, heatmap_legend_side = "right")
+
+
+png("C:\\Users\\aforn\\OneDrive\\Documents\\SingleCell\\heatmap_on.png", res = 550, width = 6000, height = 4000)
+draw(heatmap_on + heatmap_on_bin, heatmap_legend_side = "bottom")
+dev.off
+
+```
+
